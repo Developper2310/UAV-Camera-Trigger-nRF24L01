@@ -1,0 +1,256 @@
+#include "stm32f1xx_hal.h"
+#include <string.h>
+#include <stdbool.h>
+
+// Pin Tanımları
+#define LED_PIN GPIO_PIN_13
+#define LED_GPIO GPIOC
+#define BUTTON_PIN GPIO_PIN_0
+#define BUTTON_GPIO GPIOB
+#define CE_PIN GPIO_PIN_1
+#define CE_GPIO GPIOA
+#define CSN_PIN GPIO_PIN_4
+#define CSN_GPIO GPIOA
+
+// SPI ve UART Handle'lar
+SPI_HandleTypeDef hspi1;
+UART_HandleTypeDef huart1;
+
+// Zaman ve Durum Kontrolü
+uint32_t messageSentTime = 0;
+bool waitingForAck = false;
+
+// NRF24L01 Fonksiyonları
+void NRF24_WriteRegister(uint8_t reg, uint8_t value);
+void NRF24_WriteRegisterMulti(uint8_t reg, uint8_t* data, uint8_t len);
+uint8_t NRF24_ReadRegister(uint8_t reg);
+void NRF24_SetChannel(uint8_t ch);
+void NRF24_Begin(void);
+void NRF24_OpenWritingPipe(uint64_t address);
+void NRF24_OpenReadingPipe(uint8_t pipe, uint64_t address);
+void NRF24_StartListening(void);
+void NRF24_StopListening(void);
+bool NRF24_Write(const char* data, uint8_t len);
+bool NRF24_Available(void);
+void NRF24_Read(char* buffer, uint8_t len);
+
+// Yardımcı Fonksiyonlar
+void SetLED(bool state);
+bool IsButtonPressed(void);
+void SendCameraOnMessage(void);
+void CheckForAck(void);
+
+// Başlangıç
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_USART1_UART_Init();
+
+    NRF24_Begin();
+    NRF24_OpenWritingPipe(0xF0F0F0F0E1LL);
+    NRF24_OpenReadingPipe(1, 0xF0F0F0F0D2LL);
+    NRF24_StopListening();
+
+    while (1) {
+        if (!waitingForAck && IsButtonPressed()) {
+            SendCameraOnMessage();
+            waitingForAck = true;
+            messageSentTime = HAL_GetTick();
+        }
+
+        if (waitingForAck) {
+            CheckForAck();
+
+            if (HAL_GetTick() - messageSentTime > 3000) {
+                waitingForAck = false;
+                SetLED(false);
+            }
+        }
+        HAL_Delay(50);
+    }
+}
+
+void NRF24_Begin(void) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(CE_GPIO, CE_PIN, GPIO_PIN_RESET);
+    NRF24_SetChannel(76);
+    NRF24_WriteRegister(0x01, 0x00);
+    NRF24_WriteRegister(0x04, 0x00);
+}
+
+void NRF24_SetChannel(uint8_t ch) {
+    NRF24_WriteRegister(0x05, ch);
+}
+
+void NRF24_OpenWritingPipe(uint64_t address) {
+    NRF24_WriteRegisterMulti(0x0A, (uint8_t*)&address, 5);
+    NRF24_WriteRegisterMulti(0x10, (uint8_t*)&address, 5);
+}
+
+void NRF24_OpenReadingPipe(uint8_t pipe, uint64_t address) {
+    NRF24_WriteRegisterMulti(0x0B + pipe, (uint8_t*)&address, 5);
+    NRF24_WriteRegister(0x02, 0x01);
+    NRF24_WriteRegister(0x1C, 0x01);
+    NRF24_WriteRegister(0x1D, 0x04);
+}
+
+void NRF24_StartListening(void) {
+    NRF24_WriteRegister(0x00, 0x0B);
+    HAL_GPIO_WritePin(CE_GPIO, CE_PIN, GPIO_PIN_SET);
+}
+
+void NRF24_StopListening(void) {
+    HAL_GPIO_WritePin(CE_GPIO, CE_PIN, GPIO_PIN_RESET);
+    NRF24_WriteRegister(0x00, 0x0A);
+}
+
+bool NRF24_Write(const char* data, uint8_t len) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_RESET);
+    uint8_t cmd = 0xA0;
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Transmit(&hspi1, (uint8_t*)data, len, 100);
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(CE_GPIO, CE_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(CE_GPIO, CE_PIN, GPIO_PIN_RESET);
+    return true;
+}
+
+bool NRF24_Available(void) {
+    uint8_t status = NRF24_ReadRegister(0x07);
+    return (status & 0x40);
+}
+
+void NRF24_Read(char* buffer, uint8_t len) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_RESET);
+    uint8_t cmd = 0x61;
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Receive(&hspi1, (uint8_t*)buffer, len, 100);
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+    NRF24_WriteRegister(0x07, 0x40);
+}
+
+void NRF24_WriteRegister(uint8_t reg, uint8_t value) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_RESET);
+    uint8_t cmd = 0x20 | (reg & 0x1F);
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Transmit(&hspi1, &value, 1, 100);
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+}
+
+void NRF24_WriteRegisterMulti(uint8_t reg, uint8_t* data, uint8_t len) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_RESET);
+    uint8_t cmd = 0x20 | (reg & 0x1F);
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Transmit(&hspi1, data, len, 100);
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+}
+
+uint8_t NRF24_ReadRegister(uint8_t reg) {
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_RESET);
+    uint8_t cmd = 0x00 | (reg & 0x1F);
+    uint8_t value;
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Receive(&hspi1, &value, 1, 100);
+    HAL_GPIO_WritePin(CSN_GPIO, CSN_PIN, GPIO_PIN_SET);
+    return value;
+}
+
+void SetLED(bool state) {
+    HAL_GPIO_WritePin(LED_GPIO, LED_PIN, state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+bool IsButtonPressed(void) {
+    return HAL_GPIO_ReadPin(BUTTON_GPIO, BUTTON_PIN) == GPIO_PIN_SET;
+}
+
+void SendCameraOnMessage(void) {
+    const char* msg = "CAMERA_ON";
+    NRF24_Write(msg, strlen(msg));
+}
+
+void CheckForAck(void) {
+    NRF24_StartListening();
+    HAL_Delay(10);
+    if (NRF24_Available()) {
+        char buffer[32];
+        NRF24_Read(buffer, sizeof(buffer));
+        if (strstr(buffer, "ACK") != NULL) {
+            SetLED(true);
+            waitingForAck = false;
+        }
+    }
+    NRF24_StopListening();
+}
+
+// Donanım Başlatıcıları
+void MX_GPIO_Init(void) {
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio = {0};
+
+    gpio.Pin = LED_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LED_GPIO, &gpio);
+
+    gpio.Pin = BUTTON_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(BUTTON_GPIO, &gpio);
+
+    gpio.Pin = CE_PIN | CSN_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(CE_GPIO, &gpio);
+}
+
+void MX_SPI1_Init(void) {
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    HAL_SPI_Init(&hspi1);
+}
+
+void MX_USART1_UART_Init(void) {
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart1);
+}
+
+void SystemClock_Config(void) {
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+    HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0);
+}
